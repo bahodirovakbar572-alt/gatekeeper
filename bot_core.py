@@ -1,53 +1,50 @@
 import os
 import re
 import json
-import time
-import threading
 import logging
 from datetime import datetime, timedelta
 
 import telebot
 from telebot import types
-from flask import Flask
 import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("modbot")
 
 # ============================================================
-#  SOZLAMALAR (Environment o'zgaruvchilardan olinadi)
+#  SOZLAMALAR
 # ============================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    BOT_TOKEN = input("8898545279:AAGmNE5gxjyNte-GtQ1zJYRYZhaBAQ_f7Cg").strip()
+    try:
+        BOT_TOKEN = input("8898545279:AAGmNE5gxjyNte-GtQ1zJYRYZhaBAQ_f7Cg").strip()
+    except EOFError:
+        BOT_TOKEN = ""
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable topilmadi! Uni sozlang.")
+    raise RuntimeError("BOT_TOKEN topilmadi! Uni Vercel/lokal .env da yoki terminalda kiriting.")
 
-PORT = int(os.environ.get("PORT", 10000))
-# Deploy qilingandan keyin o'zingizning public URL manzilingizni shu yerga bering
-# Masalan: https://mening-botim.onrender.com
-SELF_URL = os.environ.get("SELF_URL")
+WARN_LIMIT = int(os.environ.get("WARN_LIMIT", 3))
+MUTE_MINUTES = int(os.environ.get("MUTE_MINUTES", 30))
 
-WARN_LIMIT = int(os.environ.get("WARN_LIMIT", 3))       # nechta ogohlantirishdan keyin mute
-MUTE_MINUTES = int(os.environ.get("MUTE_MINUTES", 30))  # necha daqiqaga mute
-WARNINGS_FILE = "warnings.json"
+# Upstash Redis (bepul) - saqlash uchun. Berilmasa, lokal fayl bilan ishlaydi
+# (faqat lokal test uchun, Vercel'da fayl saqlanmaydi!).
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=False)
 
 # ============================================================
-#  TA'QIQLANGAN SO'ZLAR RO'YXATI
-#  O'zingizga kerakli so'zlarni shu yerga qo'shing (kichik harflarda)
+#  TA'QIQLANGAN SO'ZLAR / RUXSAT ETILGAN DOMENLAR
 # ============================================================
 BAD_WORDS = {
     "so'z1", "so'z2",
-    # misol uchun: "blyat", "suka", "pidor" va h.k.
-    # to'liq ro'yxatni o'zingiz to'ldiring
+    # bu yerga o'zingizga kerakli haqoratli so'zlarni qo'shing (kichik harflarda)
 }
 
-# Ruxsat etilgan domenlar — shu domenlarga link tashlash mumkin
 ALLOWED_DOMAINS = {
-    "instagram.com", "youtube.com", "youtu.be",
+    "t.me", "telegram.me", "telegram.org",
+    "youtube.com", "youtu.be",
 }
 
 URL_REGEX = re.compile(
@@ -57,49 +54,87 @@ URL_REGEX = re.compile(
 )
 
 # ============================================================
-#  OGOHLANTIRISHLARNI SAQLASH (fayl asosida, oddiy)
+#  SAQLASH QATLAMI (Upstash Redis REST API yoki lokal fayl)
 # ============================================================
-warnings_lock = threading.Lock()
+LOCAL_FILE = "warnings.json"
 
 
-def load_warnings():
-    if os.path.exists(WARNINGS_FILE):
+def _local_load():
+    if os.path.exists(LOCAL_FILE):
         try:
-            with open(WARNINGS_FILE, "r", encoding="utf-8") as f:
+            with open(LOCAL_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return {}
     return {}
 
 
-def save_warnings(data):
+def _local_save(data):
     try:
-        with open(WARNINGS_FILE, "w", encoding="utf-8") as f:
+        with open(LOCAL_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.warning(f"warnings.json ga yozib bo'lmadi: {e}")
+        logger.warning(f"Lokal faylga yozib bo'lmadi: {e}")
 
 
-warnings_data = load_warnings()
+def _key(chat_id, user_id):
+    return f"warn:{chat_id}:{user_id}"
 
 
-def get_key(chat_id, user_id):
-    return f"{chat_id}_{user_id}"
+def get_warning_count(chat_id, user_id):
+    key = _key(chat_id, user_id)
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            r = requests.get(
+                f"{UPSTASH_URL}/get/{key}",
+                headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+                timeout=5,
+            )
+            result = r.json().get("result")
+            return int(result) if result else 0
+        except Exception as e:
+            logger.warning(f"Upstash get xato: {e}")
+            return 0
+    else:
+        data = _local_load()
+        return data.get(key, 0)
 
 
-def add_warning(chat_id, user_id):
-    with warnings_lock:
-        key = get_key(chat_id, user_id)
-        warnings_data[key] = warnings_data.get(key, 0) + 1
-        save_warnings(warnings_data)
-        return warnings_data[key]
+def increment_warning(chat_id, user_id):
+    key = _key(chat_id, user_id)
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            r = requests.post(
+                f"{UPSTASH_URL}/incr/{key}",
+                headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+                timeout=5,
+            )
+            return int(r.json().get("result", 0))
+        except Exception as e:
+            logger.warning(f"Upstash incr xato: {e}")
+            return 0
+    else:
+        data = _local_load()
+        data[key] = data.get(key, 0) + 1
+        _local_save(data)
+        return data[key]
 
 
 def reset_warning(chat_id, user_id):
-    with warnings_lock:
-        key = get_key(chat_id, user_id)
-        warnings_data[key] = 0
-        save_warnings(warnings_data)
+    key = _key(chat_id, user_id)
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            requests.post(
+                f"{UPSTASH_URL}/set/{key}/0",
+                headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+                timeout=5,
+            )
+        except Exception as e:
+            logger.warning(f"Upstash reset xato: {e}")
+    else:
+        data = _local_load()
+        data[key] = 0
+        _local_save(data)
 
 
 # ============================================================
@@ -171,7 +206,6 @@ def moderate(message):
     user = message.from_user
     chat_id = message.chat.id
 
-    # Adminlarni tekshirmaymiz
     if is_admin(chat_id, user.id):
         return
 
@@ -187,7 +221,7 @@ def moderate(message):
     except Exception as e:
         logger.warning(f"Xabarni o'chirib bo'lmadi: {e}")
 
-    count = add_warning(chat_id, user.id)
+    count = increment_warning(chat_id, user.id)
     sabab = "haqoratli so'z" if bad_word else "notanish link"
     mention = f"<a href='tg://user?id={user.id}'>{user.first_name}</a>"
 
@@ -210,48 +244,22 @@ def moderate(message):
             logger.error(f"Mute qilib bo'lmadi: {e}")
             bot.send_message(
                 chat_id,
-                f"{mention}, sizni cheklashga ruxsatim yo'q. "
-                f"Menga admin huquqini bering.",
+                f"{mention}, sizni cheklashga ruxsatim yo'q. Menga admin huquqini bering.",
             )
 
 
 # ============================================================
-#  FLASK — bepul hosting uchun PORT ochib turadi
+#  Webhook orqali kelgan update'ni qayta ishlash
+#  (bu funksiyani api/webhook.py chaqiradi)
 # ============================================================
-app = Flask(__name__)
+def process_update(update_json: dict):
+    update = telebot.types.Update.de_json(update_json)
+    bot.process_new_updates([update])
 
 
-@app.route("/")
-def index():
-    return "Bot ishlayapti ✅"
-
-
-def run_flask():
-    app.run(host="0.0.0.0", port=PORT)
-
-
-# ============================================================
-#  SELF-PING — har 5 daqiqada o'ziga so'rov (uxlab qolmasligi uchun)
-# ============================================================
-def self_ping():
-    if not SELF_URL:
-        logger.info("SELF_URL berilmagan — self-ping ishlamaydi. "
-                     "Kerak bo'lsa environment variable qo'shing.")
-        return
-    while True:
-        time.sleep(300)  # 5 daqiqa
-        try:
-            requests.get(SELF_URL, timeout=10)
-            logger.info("Self-ping yuborildi.")
-        except Exception as e:
-            logger.warning(f"Self-ping xato: {e}")
-
-
-# ============================================================
-#  ISHGA TUSHIRISH
-# ============================================================
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    threading.Thread(target=self_ping, daemon=True).start()
-    logger.info("Bot polling boshlandi...")
-    bot.infinity_polling(timeout=30, long_polling_timeout=30)
+    print("Bot ishga tushmoqda...")
+    try:
+        bot.infinity_polling(timeout=30, long_polling_timeout=30)
+    except KeyboardInterrupt:
+        print("Bot to'xtatildi.")
