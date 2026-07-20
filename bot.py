@@ -14,9 +14,12 @@ logger = logging.getLogger("modbot")
 # ============================================================
 #  SOZLAMALAR
 # ============================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable topilmadi! Uni sozlang.")
+    BOT_TOKEN = input("Bot tokenni kiriting: ").strip()
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN topilmadi! Tokenni kiriting yoki environmentga qo'ying.")
 
 WARN_LIMIT = int(os.environ.get("WARN_LIMIT", 3))       # nechta ogohlantirishdan keyin mute
 MUTE_MINUTES = int(os.environ.get("MUTE_MINUTES", 30))  # necha daqiqaga mute
